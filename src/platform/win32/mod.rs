@@ -67,7 +67,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow,
     IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx,
     PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    GetWindowPlacement, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, HWND_TOP, SWP_SHOWWINDOW, WINDOWPLACEMENT, WS_VISIBLE,
     CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HTBOTTOM, HTBOTTOMLEFT,
     HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
     HWND_MESSAGE, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, MINMAXINFO,
@@ -105,6 +106,9 @@ thread_local! {
     static ACTIVE_HWND: Cell<isize> = const { Cell::new(0) };
     /// 本线程上仍存活的 windui 窗口，见 [`LiveWindows`]。
     static LIVE_WINDOWS: RefCell<LiveWindows> = const { RefCell::new(LiveWindows::new()) };
+    /// 进入全屏前每个窗口的样式与 placement（按 HWND 区分，多窗口互不影响）。
+    static FULLSCREEN_SAVED: RefCell<std::collections::HashMap<isize, (isize, WINDOWPLACEMENT)>> =
+        RefCell::new(std::collections::HashMap::new());
 }
 
 /// 供 platform::inject_parent 读取当前活跃窗口句柄（单线程，消息循环内保证有效）。
@@ -3081,6 +3085,62 @@ unsafe fn apply_hotkey_ops(hwnd: HWND) {
     }
 }
 
+/// 切换全屏：去掉标题栏与边框，把窗口铺满所在显示器；再切一次恢复原样式与位置。
+///
+/// 保存的是 `GWL_STYLE` 与 `WINDOWPLACEMENT`（后者一并记住最大化/最小化前的摆放），
+/// 故退出后能回到进入前的状态。按 HWND 存，多个窗口同时全屏不会串。
+unsafe fn toggle_fullscreen(hwnd: HWND) {
+    let key = hwnd.0 as isize;
+    let saved = FULLSCREEN_SAVED.with(|m| m.borrow_mut().remove(&key));
+    match saved {
+        None => {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let mut placement = WINDOWPLACEMENT::default();
+            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            let _ = GetWindowPlacement(hwnd, &mut placement);
+
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                return;
+            }
+            let r = info.rcMonitor;
+            let fullscreen_style = (style & !(WS_OVERLAPPEDWINDOW.0 as isize))
+                | WS_POPUP.0 as isize
+                | WS_VISIBLE.0 as isize;
+            SetWindowLongPtrW(hwnd, GWL_STYLE, fullscreen_style);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            );
+            FULLSCREEN_SAVED.with(|m| {
+                m.borrow_mut().insert(key, (style, placement));
+            });
+        }
+        Some((style, placement)) => {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            let _ = SetWindowPlacement(hwnd, &placement);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+}
+
 /// 执行一个窗口操作。**调用方须已释放 `WindowState` 借用**——此处的 OS 调用会同步
 /// 重入 `wnd_proc`（`ShowWindow` 派发 WM_SHOWWINDOW、`SetForegroundWindow` 派发
 /// WM_ACTIVATE），届时会再次 `state_from`。
@@ -3103,9 +3163,15 @@ unsafe fn run_window_op(hwnd: HWND, op: Option<WindowOp>) {
         Some(WindowOp::Maximize) => {
             let _ = ShowWindow(hwnd, SW_MAXIMIZE);
         }
+        Some(WindowOp::ToggleFullscreen) => toggle_fullscreen(hwnd),
         // SW_RESTORE 同时覆盖"从最大化还原"与"从最小化还原"，这正是本 op 的语义。
+        // 全屏中则先退出全屏（恢复原样式与位置），再走常规还原。
         Some(WindowOp::Restore) => {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            if FULLSCREEN_SAVED.with(|m| m.borrow().contains_key(&(hwnd.0 as isize))) {
+                toggle_fullscreen(hwnd);
+            } else {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
         }
         Some(WindowOp::Show) => show_and_activate(hwnd),
         Some(WindowOp::Hide) => {

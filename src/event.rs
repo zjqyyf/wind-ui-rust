@@ -25,6 +25,12 @@ pub enum WindowOp {
     Maximize,
     /// 从最大化 / 最小化还原（本就是常规态时无操作）。
     Restore,
+    /// 全屏 / 退出全屏切换：覆盖所在显示器，隐藏标题栏与任务栏。
+    ///
+    /// 平台实现：Windows 切换窗口样式并覆盖显示器；X11 发 `_NET_WM_STATE_FULLSCREEN`
+    /// 客户端消息；Wayland 用 `xdg_toplevel.set_fullscreen`；macOS 用
+    /// `NSWindow.toggleFullScreen:`。
+    ToggleFullscreen,
     /// 显示并前置窗口（从隐藏态唤起）。
     Show,
     /// 隐藏窗口（进程继续存活）。配合托盘或全局热键使用；
